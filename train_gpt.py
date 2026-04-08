@@ -552,6 +552,73 @@ def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
     return torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
 
 
+def _sapci_orthonormal_basis(d_model: int, r: int, device: torch.device, dtype: torch.dtype) -> Tensor:
+    """P in R^{d×r} with orthonormal columns (shared state subspace)."""
+    x = torch.randn(d_model, r, device=device, dtype=dtype)
+    q, _ = torch.linalg.qr(x, mode="reduced")
+    return q[:, :r]
+
+
+@torch.no_grad()
+def _apply_state_aligned_precaching_init(model: GPT) -> None:
+    """
+    Minimal SAPCI variant for stability:
+      - Q is biased to shared state subspace P,
+      - V is biased to shared state subspace P,
+      - K optionally uses shared state subspace P,
+      - O maps into span(P): W_O = R Pᵀ with small R,
+      - MLP output layer maps into null(Pᵀ): W_mlp = (I − PPᵀ) W₀ so residual MLP updates avoid the state subspace.
+    """
+    if not model.blocks:
+        return
+
+    print("Applying SAPCI initialization...")
+    device = model.blocks[0].attn.c_q.weight.device
+    dtype = model.blocks[0].attn.c_q.weight.dtype
+    d_model = model.blocks[0].attn.c_q.in_features
+    num_heads = model.blocks[0].attn.num_heads
+    num_kv_heads = model.blocks[0].attn.num_kv_heads
+    head_dim = model.blocks[0].attn.head_dim
+
+    # Fixed simple constants (no external SAPCI hyperparameters).
+    r = d_model // 8
+    P = _sapci_orthonormal_basis(d_model, r, device, dtype)
+    I = torch.eye(d_model, device=device, dtype=dtype)
+    null_proj = I - P @ P.T
+
+    sigma = 1 / math.sqrt(d_model)
+
+    for block in model.blocks:
+        attn = block.attn
+        mlp = block.mlp
+        hd = head_dim
+        hidden = mlp.proj.in_features
+
+        for h in range(num_heads):
+            rs, re = h * hd, (h + 1) * hd
+            Aq = torch.randn(hd, r, device=device, dtype=dtype) * sigma
+            attn.c_q.weight.data[rs:re, :] = Aq @ P.T
+
+        # GQA layout: c_k has num_kv_heads groups, not num_heads.
+        # for g in range(num_kv_heads):
+        #     rs, re = g * hd, (g + 1) * hd
+        #     Ak = torch.randn(hd, r, device=device, dtype=dtype) * sigma
+        #     attn.c_k.weight.data[rs:re, :] = Ak @ P.T
+
+        for g in range(num_kv_heads):
+            rs, re = g * hd, (g + 1) * hd
+            Bv_state = torch.randn(hd, r, device=device, dtype=dtype) * sigma
+            attn.c_v.weight.data[rs:re, :] = Bv_state @ P.T
+
+        # O: y ↦ y W_Oᵀ with W_O = R Pᵀ ⇒ outputs lie in span(P).
+        R_o = torch.randn(d_model, r, device=device, dtype=dtype) * sigma
+        attn.proj.weight.data.copy_(R_o @ P.T)
+
+        # MLP last layer: columns of Wᵀ in null(Pᵀ) so Pᵀ (h Wᵀ)ᵀ = 0 for all h.
+        W0 = torch.randn(d_model, hidden, device=device, dtype=dtype) * sigma
+        mlp.proj.weight.data.copy_(null_proj @ W0)
+
+
 class CausalSelfAttention(nn.Module):
     def __init__(
         self,
@@ -696,6 +763,7 @@ class GPT(nn.Module):
         for module in self.modules():
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
+        _apply_state_aligned_precaching_init(self)
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
@@ -823,6 +891,10 @@ def main() -> None:
     # MODEL + OPTIMIZER SETUP
     # -----------------------------
 
+    if args.sapci_init:
+        log0(
+            f"init:SAPCI mode=write_only state_frac=0.125 mlp_null_coupling=0.05 "
+        )
     base_model = GPT(
         vocab_size=args.vocab_size,
         num_layers=args.num_layers,
@@ -835,6 +907,7 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        sapci_init=args.sapci_init,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
